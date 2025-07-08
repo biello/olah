@@ -25,6 +25,7 @@ from fastapi.responses import (
 )
 from fastapi.templating import Jinja2Templates
 from fastapi_utils.tasks import repeat_every
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import git
 import httpx
@@ -34,6 +35,25 @@ from olah.proxy.pathsinfo import pathsinfo_generator
 from olah.proxy.tree import tree_generator
 from olah.utils.disk_utils import convert_bytes_to_human_readable, convert_to_bytes, get_folder_size, sort_files_by_access_time, sort_files_by_modify_time, sort_files_by_size
 from olah.utils.url_utils import clean_path
+from olah.utils.logging import build_logger
+
+# Initialize logger
+logger = build_logger("olah", "olah.log", logger_dir="./logs")
+
+from olah.configs import OlahConfig
+from olah.errors import error_repo_not_found, error_page_not_found, error_revision_not_found
+from olah.mirror.repos import LocalMirrorRepo
+from olah.proxy.files import cdn_file_get_generator, file_get_generator
+from olah.proxy.lfs import lfs_get_generator, lfs_head_generator
+from olah.proxy.meta import meta_generator
+from olah.utils.rule_utils import check_proxy_rules_hf, get_org_repo
+from olah.utils.repo_utils import (
+    check_commit_hf,
+    get_commit_hf,
+    get_newest_commit_hf,
+    parse_org_repo,
+)
+from olah.constants import OLAH_CODE_DIR, REPO_TYPES_MAPPING
 
 BASE_SETTINGS = False
 if not BASE_SETTINGS:
@@ -53,23 +73,6 @@ if not BASE_SETTINGS:
 if not BASE_SETTINGS:
     raise Exception("Cannot import BaseSettings from pydantic or pydantic-settings")
 
-from olah.configs import OlahConfig
-from olah.errors import error_repo_not_found, error_page_not_found, error_revision_not_found
-from olah.mirror.repos import LocalMirrorRepo
-from olah.proxy.files import cdn_file_get_generator, file_get_generator
-from olah.proxy.lfs import lfs_get_generator, lfs_head_generator
-from olah.proxy.meta import meta_generator
-from olah.utils.rule_utils import check_proxy_rules_hf, get_org_repo
-from olah.utils.repo_utils import (
-    check_commit_hf,
-    get_commit_hf,
-    get_newest_commit_hf,
-    parse_org_repo,
-)
-from olah.constants import OLAH_CODE_DIR, REPO_TYPES_MAPPING
-from olah.utils.logging import build_logger
-
-logger = None
 
 # ======================
 # Utilities
@@ -88,15 +91,6 @@ async def check_connection(url: str) -> bool:
             return True
     except httpx.TimeoutException:
         return False
-
-# from pympler import tracker, classtracker
-# tr = tracker.SummaryTracker()
-# cr = classtracker.ClassTracker()
-# from olah.cache.bitset import Bitset
-# from olah.cache.olah_cache import OlahCache, OlahCacheHeader
-# cr.track_class(Bitset)
-# cr.track_class(OlahCacheHeader)
-# cr.track_class(OlahCache)
 
 @repeat_every(seconds=60*5)
 async def check_hf_connection() -> None:
@@ -175,6 +169,17 @@ code_file_path = os.path.abspath(__file__)
 app = FastAPI(lifespan=lifespan, debug=False)
 templates = Jinja2Templates(directory=os.path.join(OLAH_CODE_DIR, "static"))
 
+# Add middleware for access logging
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        host = request.headers.get("host", "")
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        logger.info(f"Host: {host} | Path: {request.url.path} | Method: {request.method} | Status: {response.status_code} | Time: {process_time:.2f}s")
+        return response
+
+app.add_middleware(AccessLogMiddleware)
 
 class AppSettings(BaseSettings):
     # The address of the model controller.
@@ -1090,12 +1095,20 @@ async def lfs_get(dir1: str, dir2: str, hash_repo: str, hash_file: str, request:
 # ======================
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    logger.debug(f"static path is {OLAH_CODE_DIR}")
+    # Get the actual domain from the request
+    host = request.headers.get("host", "")
+    scheme = request.url.scheme
+    current_domain = f"{scheme}://{host}"
+    
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
-            "scheme": app.state.app_settings.config.mirror_scheme,
-            "netloc": app.state.app_settings.config.mirror_netloc,
+            "scheme": scheme,
+            "netloc": host,
+            "current_domain": current_domain,
+            "hf_endpoint": f"{app.state.app_settings.config.hf_scheme}://{app.state.app_settings.config.hf_netloc}"
         },
     )
 
@@ -1108,6 +1121,11 @@ async def repos(request: Request):
     models_repos = [get_org_repo(*repo.split("/")[-2:]) for repo in models_repos]
     spaces_repos = [get_org_repo(*repo.split("/")[-2:]) for repo in spaces_repos]
 
+    # Get the actual domain from the request
+    host = request.headers.get("host", "")
+    scheme = request.url.scheme
+    current_domain = f"{scheme}://{host}"
+
     return templates.TemplateResponse(
         "repos.html",
         {
@@ -1115,6 +1133,8 @@ async def repos(request: Request):
             "datasets_repos": datasets_repos,
             "models_repos": models_repos,
             "spaces_repos": spaces_repos,
+            "current_domain": current_domain,
+            "hf_endpoint": f"{app.state.app_settings.config.hf_scheme}://{app.state.app_settings.config.hf_netloc}"
         },
     )
 
@@ -1141,7 +1161,10 @@ def init():
     parser.add_argument("--log-path", type=str, default="./logs", help="The folder to save logs")
     args = parser.parse_args()
     
-    logger = build_logger("olah", "olah.log", logger_dir=args.log_path)
+    # Update logger directory if specified
+    if args.log_path != "./logs":
+        global logger
+        logger = build_logger("olah", "olah.log", logger_dir=args.log_path)
     
     def is_default_value(args, arg_name):
         if hasattr(args, arg_name):
